@@ -1,4 +1,5 @@
 simulation_results.json
+*_weights/
 
 # Byte-compiled / optimized / DLL files
 *.out

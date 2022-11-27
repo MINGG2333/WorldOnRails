@@ -1,8 +1,11 @@
 import os
 import math
+import time
+import json
 import yaml
 import lmdb
 import numpy as np
+from PIL import Image
 import torch
 import wandb
 import carla
@@ -16,6 +19,13 @@ from utils import visualize_obs
 
 from rails.models import EgoModel, CameraModel
 from autoagents.waypointer import Waypointer
+
+# jxy: addition; (add display.py and fix RoutePlanner.py or Waypointer.py)
+from team_code.display import HAS_DISPLAY, Saver, debug_display
+# addition from team_code/map_agent.py
+from carla_project.src.common import CONVERTER, COLOR
+from carla_project.src.carla_env import draw_traffic_lights, get_nearby_lights
+
 
 def get_entry_point():
     return 'ImageAgent'
@@ -33,6 +43,14 @@ class ImageAgent(AutonomousAgent):
 
         self.track = Track.SENSORS
         self.num_frames = 0
+        self.config_path = path_to_conf_file
+        self.wall_start = time.time()
+        self.initialized = False
+
+        return AgentSaver
+
+        # jxy: add return AgentSaver and init_ads (setup keep 5 lines); rm save_path;
+    def init_ads(self, path_to_conf_file):
 
         with open(path_to_conf_file, 'r') as f:
             config = yaml.safe_load(f)
@@ -51,7 +69,7 @@ class ImageAgent(AutonomousAgent):
         self.waypointer = None
 
         if self.log_wandb:
-            wandb.init(project='carla_evaluate')
+            wandb.init(project='carla_evaluate_WorldOnRails')
             
         self.steers = torch.tensor(np.linspace(-self.max_steers,self.max_steers,self.num_steers)).float().to(self.device)
         self.throts = torch.tensor(np.linspace(0,self.max_throts,self.num_throts)).float().to(self.device)
@@ -59,19 +77,25 @@ class ImageAgent(AutonomousAgent):
         self.prev_steer = 0
         self.lane_change_counter = 0
         self.stop_counter = 0
+        self.lane_changed = None
 
-    def destroy(self):
+    def destroy(self): # jxy mv before _init
         if len(self.vizs) == 0:
             return
 
         self.flush_data()
-        self.prev_steer = 0
-        self.lane_change_counter = 0
-        self.stop_counter = 0
-        self.lane_changed = None
-        
+
         del self.waypointer
         del self.image_model
+        torch.cuda.empty_cache()
+        super().destroy()
+
+    def _init(self):
+
+        self.initialized = True
+
+        # del self.net # jxy from destroy to here, as twice destroy in a round
+        super()._init() # jxy add
     
     def flush_data(self):
 
@@ -91,11 +115,21 @@ class ImageAgent(AutonomousAgent):
             'width': 160, 'height': 240, 'fov': 60, 'id': f'Wide_RGB'},
             {'type': 'sensor.camera.rgb', 'x': self.camera_x, 'y': 0, 'z': self.camera_z, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
             'width': 384, 'height': 240, 'fov': 50, 'id': f'Narrow_RGB'},
+            # jxy: addition from team_code/map_agent.py
+            {
+                'type': 'sensor.camera.semantic_segmentation',
+                'x': 0.0, 'y': 0.0, 'z': 100.0,
+                'roll': 0.0, 'pitch': -90.0, 'yaw': 0.0,
+                'width': 512, 'height': 512, 'fov': 5 * 10.0,
+                'id': 'map'
+                },
         ]
         
         return sensors
 
     def run_step(self, input_data, timestamp):
+        if not self.initialized:
+            self._init()
         
         _, wide_rgb = input_data.get(f'Wide_RGB')
         _, narr_rgb = input_data.get(f'Narrow_RGB')
@@ -114,9 +148,10 @@ class ImageAgent(AutonomousAgent):
         if self.waypointer is None:
             self.waypointer = Waypointer(self._global_plan, gps)
 
-        _, _, cmd = self.waypointer.tick(gps)
+        # jxy: add pos
+        (_, _, cmd), pos = self.waypointer.tick(gps)
 
-        spd = ego.get('spd')
+        spd = ego.get('speed')
         
         cmd_value = cmd.value-1
         cmd_value = 3 if cmd_value < 0 else cmd_value
@@ -166,7 +201,47 @@ class ImageAgent(AutonomousAgent):
 
         self.num_frames += 1
 
-        return carla.VehicleControl(steer=steer, throttle=throt, brake=brake)
+        control = carla.VehicleControl(steer=steer, throttle=throt, brake=brake)
+
+        # jxy addition:
+        self.step = self.num_frames
+        tick_data = {
+                'rgb': rgb,
+                'gps': pos,
+                'speed': spd,
+                'compass': -1,
+                }
+        tick_data['far_command'] = cmd
+        # tick_data['R_pos_from_head'] = R
+        tick_data['offset_pos'] = np.array([pos[0], pos[1]])
+        # from team_code/map_agent.py:
+        self._actors = self._world.get_actors()
+        self._traffic_lights = get_nearby_lights(self._vehicle, self._actors.filter('*traffic_light*'))
+        topdown = input_data['map'][1][:, :, 2]
+        topdown = draw_traffic_lights(topdown, self._vehicle, self._traffic_lights)
+        tick_data['topdown'] = COLOR[CONVERTER[topdown]]
+
+        if HAS_DISPLAY: # jxy: change
+            debug_display(tick_data, control.steer, control.throttle, control.brake, self.step)
+
+        self.record_step(tick_data, control, ) # jxy: add
+        return control
+
+    # jxy: add record_step
+    def record_step(self, tick_data, control, pred_waypoint=[]):
+        # draw pred_waypoint
+        # if len(pred_waypoint):
+            # pred_waypoint[:,1] *= -1
+            # pred_waypoint = tick_data['R_pos_from_head'].dot(pred_waypoint.T).T
+        self.waypointer.run_step2(pred_waypoint, is_gps=False, store=False) # metadata['wp_1'] relative to ego head (as y)
+        # addition: from leaderboard/team_code/auto_pilot.py
+        speed = tick_data['speed']
+        self._recorder_tick(control) # trjs
+        ego_bbox = self.gather_info() # metrics
+        self.waypointer.run_step2(ego_bbox + tick_data['offset_pos'], is_gps=True, store=False)
+        self.waypointer.show_route()
+        if self.save_path is not None and self.step % self.record_every_n_step == 0:
+            self.save(control.steer, control.throttle, control.brake, tick_data)
     
     def _lerp(self, v, x):
         D = v.shape[0]
@@ -226,3 +301,79 @@ def load_state_dict(model, path):
         new_state_dict[name] = v
     
     model.load_state_dict(new_state_dict)
+
+
+# jxy: mv save in AgentSaver
+class AgentSaver(Saver):
+    def __init__(self, path_to_conf_file, dict_, list_):
+        self.config_path = path_to_conf_file
+
+        # jxy: according to sensor
+        self.rgb_list = ['rgb', 'topdown', ] # 'bev', 
+        self.add_img = [] # 'flow', 'out', 
+        self.lidar_list = [] # 'lidar_0', 'lidar_1',
+        self.dir_names = self.rgb_list + self.add_img + self.lidar_list + ['pid_metadata']
+
+        super().__init__(dict_, list_)
+
+    def run(self): # jxy: according to init_ads
+
+        super().run()
+
+    def _save(self, tick_data):    
+        # addition
+        # save_action_based_measurements = tick_data['save_action_based_measurements']
+        self.save_path = tick_data['save_path']
+        if not (self.save_path / 'ADS_log.csv' ).exists():
+            # addition: generate dir for every total_i
+            self.save_path.mkdir(parents=True, exist_ok=True)
+            for dir_name in self.dir_names:
+                (self.save_path / dir_name).mkdir(parents=True, exist_ok=False)
+
+            # according to self.save data_row_list
+            title_row = ','.join(
+                ['frame_id', 'far_command', 'speed', 'steering', 'throttle', 'brake',] + \
+                self.dir_names
+            )
+            with (self.save_path / 'ADS_log.csv' ).open("a") as f_out:
+                f_out.write(title_row+'\n')
+
+        self.step = tick_data['frame']
+        self.save(tick_data['steer'],tick_data['throttle'],tick_data['brake'], tick_data)
+
+    # addition: modified from leaderboard/team_code/auto_pilot.py
+    def save(self, steer, throttle, brake, tick_data):
+        # frame = self.step // 10
+        frame = self.step
+
+        # 'gps' 'thetas'
+        pos = tick_data['gps']
+        speed = tick_data['speed']
+        far_command = tick_data['far_command']
+        data_row_list = [frame, far_command.name, speed, steer, throttle, brake,]
+
+        if True: # jxy: according to run_step
+            # images
+            for rgb_name in self.rgb_list + self.add_img:
+                path_ = self.save_path / rgb_name / ('%04d.png' % frame)
+                Image.fromarray(tick_data[rgb_name]).save(path_)
+                data_row_list.append(str(path_))
+            # lidar
+            for i, rgb_name in enumerate(self.lidar_list):
+                path_ = self.save_path / rgb_name / ('%04d.png' % frame)
+                Image.fromarray(matplotlib.cm.gist_earth(tick_data['lidar_processed'][0][0, i], bytes=True)).save(path_)
+                data_row_list.append(str(path_))
+
+            # pid_metadata
+            pid_metadata = tick_data['pid_metadata']
+            path_ = self.save_path / 'pid_metadata' / ('%04d.json' % frame)
+            outfile = open(path_, 'w')
+            json.dump(pid_metadata, outfile, indent=4)
+            outfile.close()
+            data_row_list.append(str(path_))
+
+        # collection
+        data_row = ','.join([str(i) for i in data_row_list])
+        with (self.save_path / 'ADS_log.csv' ).open("a") as f_out:
+            f_out.write(data_row+'\n')
+

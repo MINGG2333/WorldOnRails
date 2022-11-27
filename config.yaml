@@ -35,4 +35,4 @@ all_speeds: True
 ego_data_dir: [PATH TO PHASE 0 DATA]
 ego_model_dir: [PATH TO PHASE 0 MODEL]
 main_data_dir: [PATH TO PHASE 1/2 DATA]
-main_model_dir: [PATH TO PHASE 2 MODEL]
+main_model_dir: ../WorldOnRails/leaderboard_weights/main_model_10.th

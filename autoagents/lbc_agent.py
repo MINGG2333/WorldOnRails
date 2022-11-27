@@ -138,7 +138,7 @@ class LBCAgent(AutonomousAgent):
 
         _, _, cmd = self.waypointer.tick(gps)
         
-        spd = ego.get('spd')
+        spd = ego.get('speed')
         
         cmd_value = cmd.value-1
         cmd_value = 3 if cmd_value < 0 else cmd_value
