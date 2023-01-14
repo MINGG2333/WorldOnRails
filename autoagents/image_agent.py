@@ -42,8 +42,8 @@ class ImageAgent(AutonomousAgent):
         """
 
         self.track = Track.SENSORS
-        self.num_frames = 0
         self.config_path = path_to_conf_file
+        self.step = -1
         self.wall_start = time.time()
         self.initialized = False
 
@@ -51,6 +51,7 @@ class ImageAgent(AutonomousAgent):
 
         # jxy: add return AgentSaver and init_ads (setup keep 5 lines); rm save_path;
     def init_ads(self, path_to_conf_file):
+        self.num_frames = 0
 
         with open(path_to_conf_file, 'r') as f:
             config = yaml.safe_load(f)
